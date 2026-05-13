@@ -5,377 +5,338 @@ const cors = require('cors');
 const app = express();
 app.use(cors());
 app.use(express.json());
+
 const PORT = process.env.PORT || 5000;
 
-// ==================== CẤU HÌNH ====================
-const ALL_VI = [4,5,6,7,8,9,10,11,12,13,14,15,16,17];
-const VI_TAI = ALL_VI.filter(v => v > 10);
-const VI_XIU = ALL_VI.filter(v => v <= 10);
+// Cấu hình API HitClub (không random, thuần toán học)
+const API_HITCLUB = 'https://wtxmd52.tele68.com/v1/txmd5/sessions?cp=R&cl=R&pf=web&at=e2f4446802e76a39767a5bab32154970';
 
-// API nguồn duy nhất cho Sunwin (cả TX và Sicbo đều từ API này, vì API trả về đủ thông tin)
-const SUNWIN_API = 'https://api.wsktnus8.net/v2/history/getLastResult?gameId=ktrng_3979&size=200&tableId=39791215743193&curPage=1';
-
-// Lưu trữ cho từng loại
-let history = {
-    tx: { data: [], cache: new Map() },      // cho Tài Xỉu (dự đoán xúc xắc)
-    sicbo: { data: [], cache: new Map(), thongKeVi: {} }  // cho vị cược
+// Lưu trữ lịch sử và thống kê
+let hitclubDB = {
+    data: [],          // Lưu các phiên đã dự đoán
+    cache: new Map(),   // Cache dự đoán theo phiên (F5 không đổi)
+    thongKe: {          // Thống kê tổng thể
+        tongSoPhien: 0,
+        soLanDung: 0,
+        soLanSai: 0,
+        tiLeDung: '0%'
+    }
 };
 
-// Khởi tạo thống kê vị
-ALL_VI.forEach(v => { history.sicbo.thongKeVi[v] = { tong: 0, dung: 0, tiLe: '0%' }; });
-
-// Cập nhật thống kê vị
-function capNhatThongKeVi(viThucTe, cacViDuDoan) {
-    for (let vi of cacViDuDoan) {
-        let st = history.sicbo.thongKeVi[vi];
-        st.tong++;
-        if (vi === viThucTe) st.dung++;
-        st.tiLe = (st.dung / st.tong * 100).toFixed(1) + '%';
+// ==================== THUẬT TOÁN DỰ ĐOÁN (XÁC SUẤT THỰC TẾ, KHÔNG RANDOM) ====================
+function duDoanXucXac(lichSuResult, lichSuDice) {
+    // Nếu chưa có đủ dữ liệu, trả về mặc định an toàn
+    if (lichSuResult.length < 10) {
+        return {
+            duDoan: 'TAI',
+            dice: [4, 4, 4],
+            tong: 12,
+            doTinCay: 55,
+            giaiThich: 'Chưa đủ dữ liệu, dự đoán mặc định TAI (4,4,4) với độ tin cậy 55%'
+        };
     }
-}
-
-// ==================== HÀM FETCH ====================
-async function fetchSunwinData() {
-    try {
-        const res = await axios.get(SUNWIN_API, {
-            timeout: 10000,
-            headers: { 'User-Agent': 'Mozilla/5.0' }
-        });
-        if (res.data?.data?.resultList?.length) {
-            const last = res.data.data.resultList[0];
-            return {
-                phien: parseInt(last.gameNum.replace('#', '')),
-                tong: last.score,
-                dices: last.facesList,      // [a,b,c]
-                resultType: last.resultType
-            };
-        }
-        return null;
-    } catch (e) {
-        console.error('Fetch Sunwin error:', e.message);
-        return null;
-    }
-}
-
-// ==================== THUẬT TOÁN DỰ ĐOÁN 3 MẶT XÚC XẮC (TÀI XỈU) ====================
-function duDoanXucXac(lichSuTong, lichSuDice) {
-    // Nếu chưa đủ dữ liệu, trả về mặc định 3-4-4
-    if (lichSuTong.length < 10) return { dice: [3,4,4], tong: 11, doTinCay: 55, loai: 'Tài' };
-
-    // Dùng phương pháp trung bình trượt cho từng vị trí
-    let pos1 = [], pos2 = [], pos3 = [];
-    for (let dice of lichSuDice) {
-        if (dice && dice.length === 3) {
-            pos1.push(dice[0]); pos2.push(dice[1]); pos3.push(dice[2]);
-        }
-    }
-    if (pos1.length < 10) return { dice: [3,4,4], tong: 11, doTinCay: 55, loai: 'Tài' };
-
-    const predictNext = (arr) => {
-        const recent = arr.slice(0,5);
-        const trend = (recent[0] - recent[4]) / 4;
-        let next = recent[0] + trend;
-        next = Math.min(6, Math.max(1, Math.round(next)));
-        return next;
-    };
-    let d1 = predictNext(pos1), d2 = predictNext(pos2), d3 = predictNext(pos3);
-    let dice = [d1, d2, d3].sort((a,b)=>a-b);
-    let tong = dice.reduce((a,b)=>a+b,0);
-    let loai = tong > 10 ? 'Tài' : 'Xỉu';
-    let doTinCay = 60 + Math.min(20, (pos1.length + pos2.length + pos3.length)/3);
-    return { dice, tong, doTinCay: Math.min(90, doTinCay), loai };
-}
-
-// ==================== THUẬT TOÁN DỰ ĐOÁN 4 VỊ (THEO XÁC SUẤT) ====================
-function duDoan4Vi(lichSuTong, lichSuVi, khoangCach) {
-    if (lichSuTong.length < 10) {
-        const loai = lichSuTong[0] > 10 ? 'Tài' : 'Xỉu';
-        const macDinh = loai === 'Tài' ? [11,12,13,17] : [4,5,6,10];
-        return { viList: macDinh, loai, doTinCay: 55 };
-    }
-
-    let diem = {};
-    ALL_VI.forEach(v => diem[v] = 0);
+    
+    // 1️⃣ Phân tích xu hướng từ kết quả Tài/Xỉu (trọng số 40%)
+    let diemTaiXiu = { TAI: 0, XIU: 0 };
     let trongSo = 0;
-
-    // 1. Tần suất (30%)
-    if (lichSuVi.length >= 20) {
-        const dem = {};
-        ALL_VI.forEach(v => dem[v] = 0);
-        lichSuVi.slice(0, 100).forEach(v => dem[v]++);
-        const maxDem = Math.max(...ALL_VI.map(v => dem[v]));
-        for (let v of ALL_VI) diem[v] += (dem[v] / maxDem) * 30;
+    
+    // 5 phiên gần nhất
+    const last5 = lichSuResult.slice(0, 5);
+    const taiCount5 = last5.filter(r => r === 'TAI').length;
+    if (taiCount5 >= 4) diemTaiXiu.XIU += 40;
+    else if (taiCount5 <= 1) diemTaiXiu.TAI += 40;
+    else if (taiCount5 >= 3) diemTaiXiu.TAI += 25;
+    else diemTaiXiu.XIU += 25;
+    trongSo += 40;
+    
+    // 10 phiên gần nhất
+    if (lichSuResult.length >= 10) {
+        const last10 = lichSuResult.slice(0, 10);
+        const taiCount10 = last10.filter(r => r === 'TAI').length;
+        if (taiCount10 >= 7) diemTaiXiu.XIU += 30;
+        else if (taiCount10 <= 3) diemTaiXiu.TAI += 30;
         trongSo += 30;
     }
-
-    // 2. Xu hướng tổng (25%)
-    if (lichSuTong.length >= 20) {
-        const gan = lichSuTong.slice(0,10), truoc = lichSuTong.slice(10,20);
-        const avgGan = gan.reduce((a,b)=>a+b,0)/10;
-        const avgTruoc = truoc.reduce((a,b)=>a+b,0)/10;
-        let delta = avgGan - avgTruoc;
-        let duDoanTong = Math.min(17, Math.max(4, Math.round(avgGan + delta)));
-        for (let i = -2; i <= 2; i++) {
-            let v = duDoanTong + i;
-            if (v>=4 && v<=17) diem[v] += (1 - Math.abs(i)/3)*25;
+    
+    // 2️⃣ Phân tích chuỗi (Streak) - Phá cầu (trọng số 20%)
+    let streak = 1;
+    const lastResult = lichSuResult[0];
+    for (let i = 1; i < lichSuResult.length; i++) {
+        if (lichSuResult[i] === lastResult) streak++;
+        else break;
+    }
+    if (streak >= 4) {
+        if (lastResult === 'TAI') diemTaiXiu.XIU += 20;
+        else diemTaiXiu.TAI += 20;
+        trongSo += 20;
+    } else if (streak === 3) {
+        if (lastResult === 'TAI') diemTaiXiu.XIU += 15;
+        else diemTaiXiu.TAI += 15;
+        trongSo += 15;
+    }
+    
+    // 3️⃣ Phân tích xu hướng từ dice (các mặt xúc xắc) - trọng số 25%
+    if (lichSuDice.length >= 10) {
+        const recentDice = lichSuDice.slice(0, 10);
+        // Tính trung bình từng vị trí
+        const sumPos = [0, 0, 0];
+        for (let dice of recentDice) {
+            for (let i = 0; i < 3; i++) {
+                sumPos[i] += dice[i];
+            }
         }
+        const avgPos = sumPos.map(s => s / recentDice.length);
+        // Dự đoán xu hướng tăng/giảm cho từng vị trí
+        let tongDuDoan = 0;
+        let diceDuDoan = [];
+        for (let i = 0; i < 3; i++) {
+            const recentVals = recentDice.map(d => d[i]);
+            let trend = (recentVals[0] - recentVals[4]) / 4;
+            let nextVal = Math.round(avgPos[i] + trend);
+            nextVal = Math.min(6, Math.max(1, nextVal));
+            diceDuDoan.push(nextVal);
+            tongDuDoan += nextVal;
+        }
+        const loaiTuDice = tongDuDoan > 10 ? 'TAI' : 'XIU';
+        if (loaiTuDice === 'TAI') diemTaiXiu.TAI += 25;
+        else diemTaiXiu.XIU += 25;
         trongSo += 25;
     }
-
-    // 3. Markov bậc 1 (20%)
-    if (lichSuVi.length >= 10) {
-        const map = new Map();
-        for (let i=0; i<lichSuVi.length-1; i++) {
-            let key = lichSuVi[i];
-            let next = lichSuVi[i+1];
-            if (!map.has(key)) map.set(key, []);
-            map.get(key).push(next);
-        }
-        const last = lichSuVi[0];
-        const nextList = map.get(last);
-        if (nextList && nextList.length) {
-            const dem = {};
-            nextList.forEach(v => dem[v] = (dem[v]||0)+1);
-            const maxM = Math.max(...Object.values(dem));
-            for (let [v,cnt] of Object.entries(dem)) {
-                diem[parseInt(v)] += (cnt/maxM)*20;
-            }
-            trongSo += 20;
-        }
-    }
-
-    // 4. Dao động tài/xỉu (15%)
-    if (lichSuTong.length >= 15) {
-        const recent = lichSuTong.slice(0,15);
-        const tai = recent.filter(t=>t>10).length;
-        const xiu = recent.filter(t=>t<=10).length;
-        let uuTien = [];
-        if (tai >= 10) uuTien = [14,15,16,17];
-        else if (xiu >= 10) uuTien = [4,5,6,7];
-        else if (tai > xiu+2) uuTien = [12,13,14,16];
-        else if (xiu > tai+2) uuTien = [5,6,8,10];
-        if (uuTien.length) {
-            uuTien.forEach(v => diem[v] += 15);
-            trongSo += 15;
-        }
-    }
-
-    // 5. Khoảng cách (10%)
-    if (khoangCach.length >= 10) {
-        const avg = khoangCach.slice(0,20).reduce((a,b)=>a+b,0) / Math.min(20, khoangCach.length);
-        const lastVi = lichSuVi[0];
-        for (let i=1; i<=4; i++) {
-            let v = lastVi + Math.round(avg*i);
-            if (v>17) v = 17 - (v-17);
-            if (v<4) v = 4 + (4-v);
-            v = Math.min(17, Math.max(4, v));
-            diem[v] += 10;
-        }
-        trongSo += 10;
-    }
-
-    // Nếu không có phương pháp nào, dùng mặc định
-    if (trongSo === 0) {
-        const loai = lichSuTong[0] > 10 ? 'Tài' : 'Xỉu';
-        return { viList: loai === 'Tài' ? [11,12,13,17] : [4,5,6,10], loai, doTinCay: 50 };
-    }
-
-    // Chọn 4 vị có điểm cao nhất
-    let sorted = ALL_VI.map(v => ({ vi: v, diem: diem[v] })).sort((a,b) => b.diem - a.diem);
-    let topCandidates = sorted.slice(0,8);
-    let tongTai = topCandidates.filter(c=>c.vi>10).reduce((s,c)=>s+c.diem,0);
-    let tongXiu = topCandidates.filter(c=>c.vi<=10).reduce((s,c)=>s+c.diem,0);
-    let loai = tongTai > tongXiu ? 'Tài' : 'Xỉu';
-
-    // Lấy top4 nhưng lọc theo loại
-    let finalVi = [];
-    for (let item of sorted) {
-        if (loai === 'Tài' && item.vi > 10) finalVi.push(item.vi);
-        else if (loai === 'Xỉu' && item.vi <= 10) finalVi.push(item.vi);
-        if (finalVi.length === 4) break;
-    }
-    // Nếu chưa đủ 4, bổ sung
-    const boSung = loai === 'Tài' ? VI_TAI : VI_XIU;
-    for (let v of boSung) {
-        if (!finalVi.includes(v)) finalVi.push(v);
-        if (finalVi.length === 4) break;
-    }
-    // Nếu loại Tài, bắt buộc có 17
-    if (loai === 'Tài' && !finalVi.includes(17)) finalVi[3] = 17;
-    finalVi.sort((a,b)=>a-b);
-
-    let doTinCay = Math.min(92, 40 + Math.round((topCandidates.reduce((s,c)=>s+c.diem,0)/trongSo)*12));
-    return { viList: finalVi, loai, doTinCay };
-}
-
-// ==================== XỬ LÝ REQUEST DÙNG CHUNG ====================
-async function xuLyYeuCau(loaiGame) {
-    const data = await fetchSunwinData();
-    if (!data) throw new Error('Không fetch được dữ liệu Sunwin');
-    const phienHT = data.phien;
-
-    // Lấy lịch sử phù hợp
-    const hist = loaiGame === 'tx' ? history.tx : history.sicbo;
-    const lastPred = hist.data[0];
-
-    // Cập nhật kết quả cho dự đoán trước (nếu có dữ liệu thực tế)
-    if (lastPred && lastPred.phien_thuc_te === phienHT - 1) {
-        if (loaiGame === 'tx') {
-            // Kiểm tra dự đoán xúc xắc
-            const thucTeDice = data.dices;
-            const dung = (lastPred.dice[0] === thucTeDice[0] && lastPred.dice[1] === thucTeDice[1] && lastPred.dice[2] === thucTeDice[2]);
-            lastPred.thuc_te = thucTeDice;
-            lastPred.dung_sai = dung ? 'Đúng' : 'Sai';
-        } else {
-            // Cập nhật thống kê vị
-            capNhatThongKeVi(data.tong, lastPred.viList);
-            lastPred.thuc_te_vi = data.tong;
-            lastPred.dung_sai = lastPred.viList.includes(data.tong) ? 'Trúng 1 vị' : 'Sai';
-        }
-    }
-
-    // Kiểm tra cache theo phiên (để F5 không đổi)
-    const cacheKey = phienHT;
-    if (hist.cache.has(cacheKey)) {
-        const cached = hist.cache.get(cacheKey);
-        // Ghi lại dự đoán mới (chỉ để lịch sử, nhưng nội dung từ cache)
-        const newPred = {
-            phien_du_doan: phienHT + 1,
-            ...cached,
-            thoi_gian: new Date(),
-            phien_thuc_te: phienHT,
-            thuc_te: null,
-            dung_sai: null
-        };
-        if (loaiGame === 'tx') {
-            newPred.dice = cached.dice;
-            newPred.tong = cached.tong;
-            newPred.loai = cached.loai;
-        } else {
-            newPred.viList = cached.viList;
-            newPred.loai = cached.loai;
-        }
-        hist.data.unshift(newPred);
-        if (hist.data.length > 100) hist.data.pop();
-        // Trả về kết quả
-        if (loaiGame === 'tx') {
-            return { game: 'Sunwin Tài Xỉu', phien_hien_tai: phienHT, ket_qua_truoc: { tong: data.tong, xuc_xac: data.dices.join('-') }, du_doan_3mat: cached.dice, tong_du_doan: cached.tong, loai: cached.loai, do_tin_cay: cached.doTinCay+'%', id: '@tranhoang2286' };
-        } else {
-            return { game: 'Sunwin Sicbo', phien_hien_tai: phienHT, ket_qua_truoc: { tong: data.tong, xuc_xac: data.dices.join('-') }, du_doan_4_vi: cached.viList, loai: cached.loai, do_tin_cay: cached.doTinCay+'%', thong_ke_vi: history.sicbo.thongKeVi, id: '@tranhoang2286' };
-        }
-    }
-
-    // Xây dựng lịch sử cho thuật toán
-    let lichSuTong = [data.tong];
-    let lichSuDice = [data.dices];
-    let lichSuVi = [];
-    let khoangCach = [];
-    if (ALL_VI.includes(data.tong)) lichSuVi.push(data.tong);
-    for (let item of hist.data) {
-        if (loaiGame === 'tx' && item.thuc_te !== null) {
-            lichSuTong.push(item.tong_du_doan); // hoặc lấy từ thực tế? Ở đây dùng tổng thực tế
-            lichSuDice.push(item.thuc_te);
-        } else if (loaiGame !== 'tx' && item.thuc_te_vi !== null) {
-            lichSuTong.push(item.thuc_te_vi);
-            if (ALL_VI.includes(item.thuc_te_vi)) {
-                if (lichSuVi.length) khoangCach.push(Math.abs(item.thuc_te_vi - lichSuVi[0]));
-                lichSuVi.unshift(item.thuc_te_vi);
+    
+    // 4️⃣ Tổng hợp và quyết định
+    const duDoanCuoi = diemTaiXiu.TAI > diemTaiXiu.XIU ? 'TAI' : 'XIU';
+    let chenhLech = Math.abs(diemTaiXiu.TAI - diemTaiXiu.XIU);
+    let tyLeTinCay = 50 + Math.min(30, chenhLech);
+    tyLeTinCay = Math.min(80, Math.max(50, tyLeTinCay));
+    
+    // Tạo bộ dice dự đoán tương ứng
+    let diceDuDoan = [];
+    if (lichSuDice.length >= 10) {
+        const recentDice = lichSuDice.slice(0, 10);
+        const sumPos = [0, 0, 0];
+        for (let dice of recentDice) {
+            for (let i = 0; i < 3; i++) {
+                sumPos[i] += dice[i];
             }
         }
-    }
-    // Giới hạn độ dài
-    if (lichSuTong.length > 200) lichSuTong = lichSuTong.slice(0,200);
-    if (lichSuDice.length > 200) lichSuDice = lichSuDice.slice(0,200);
-
-    let duDoan;
-    if (loaiGame === 'tx') {
-        duDoan = duDoanXucXac(lichSuTong, lichSuDice);
-        const cacheData = { dice: duDoan.dice, tong: duDoan.tong, loai: duDoan.loai, doTinCay: duDoan.doTinCay };
-        hist.cache.set(cacheKey, cacheData);
-        const newPred = {
-            phien_du_doan: phienHT + 1,
-            dice: duDoan.dice,
-            tong_du_doan: duDoan.tong,
-            loai: duDoan.loai,
-            do_tin_cay: duDoan.doTinCay,
-            thoi_gian: new Date(),
-            phien_thuc_te: phienHT,
-            thuc_te: null,
-            dung_sai: null
-        };
-        hist.data.unshift(newPred);
-        if (hist.data.length > 100) hist.data.pop();
-        return { game: 'Sunwin Tài Xỉu', phien_hien_tai: phienHT, ket_qua_truoc: { tong: data.tong, xuc_xac: data.dices.join('-') }, du_doan_3mat: duDoan.dice, tong_du_doan: duDoan.tong, loai: duDoan.loai, do_tin_cay: duDoan.doTinCay+'%', id: '@tranhoang2286' };
+        const avgPos = sumPos.map(s => s / recentDice.length);
+        for (let i = 0; i < 3; i++) {
+            const recentVals = recentDice.map(d => d[i]);
+            let trend = (recentVals[0] - recentVals[4]) / 4;
+            let nextVal = Math.round(avgPos[i] + trend);
+            nextVal = Math.min(6, Math.max(1, nextVal));
+            diceDuDoan.push(nextVal);
+        }
     } else {
-        duDoan = duDoan4Vi(lichSuTong, lichSuVi, khoangCach);
-        const cacheData = { viList: duDoan.viList, loai: duDoan.loai, doTinCay: duDoan.doTinCay };
-        hist.cache.set(cacheKey, cacheData);
-        const newPred = {
-            phien_du_doan: phienHT + 1,
-            viList: duDoan.viList,
-            loai: duDoan.loai,
-            do_tin_cay: duDoan.doTinCay,
-            thoi_gian: new Date(),
-            phien_thuc_te: phienHT,
-            thuc_te_vi: null,
-            dung_sai: null
-        };
-        hist.data.unshift(newPred);
-        if (hist.data.length > 100) hist.data.pop();
-        return { game: 'Sunwin Sicbo', phien_hien_tai: phienHT, ket_qua_truoc: { tong: data.tong, xuc_xac: data.dices.join('-') }, du_doan_4_vi: duDoan.viList, loai: duDoan.loai, do_tin_cay: duDoan.doTinCay+'%', thong_ke_vi: history.sicbo.thongKeVi, id: '@tranhoang2286' };
+        diceDuDoan = duDoanCuoi === 'TAI' ? [4, 4, 4] : [3, 3, 3];
+    }
+    
+    diceDuDoan.sort((a,b) => a - b);
+    let tongDuDoan = diceDuDoan.reduce((a,b) => a + b, 0);
+    
+    return {
+        duDoan: duDoanCuoi,
+        dice: diceDuDoan,
+        tong: tongDuDoan,
+        doTinCay: tyLeTinCay,
+        giaiThich: `Thuật toán tổng hợp từ phân tích xu hướng (Tài/Xỉu: ${diemTaiXiu.TAI}/${diemTaiXiu.XIU})`
+    };
+}
+
+// Hàm cập nhật thống kê khi có kết quả thực tế
+function capNhatThongKe(duDoan, thucTe) {
+    hitclubDB.thongKe.tongSoPhien++;
+    const dung = (duDoan === thucTe);
+    if (dung) hitclubDB.thongKe.soLanDung++;
+    else hitclubDB.thongKe.soLanSai++;
+    hitclubDB.thongKe.tiLeDung = (hitclubDB.thongKe.soLanDung / hitclubDB.thongKe.tongSoPhien * 100).toFixed(1) + '%';
+    return dung;
+}
+
+// Hàm fetch dữ liệu từ API HitClub
+async function fetchHitClub() {
+    try {
+        const res = await axios.get(API_HITCLUB, { timeout: 10000 });
+        if (res.data && res.data.list && res.data.list.length > 0) {
+            const first = res.data.list[0];
+            const data = {
+                phien: first.id,
+                ket_qua: first.resultTruyenThong, // "TAI" hoặc "XIU"
+                dice: first.dices,
+                tong: first.point
+            };
+            // Lấy lịch sử tối đa 200 phiên
+            const history = res.data.list.slice(0, 200);
+            return { current: data, history };
+        }
+        return null;
+    } catch (error) {
+        console.error('Lỗi fetch HitClub API:', error.message);
+        return null;
     }
 }
 
-// ==================== ENDPOINTS ====================
-app.get('/sunwin-tx', async (req, res) => {
+// Endpoint chính
+app.get('/hitclub', async (req, res) => {
     try {
-        const result = await xuLyYeuCau('tx');
-        res.json(result);
-    } catch (e) {
-        res.status(500).json({ error: e.message });
+        const result = await fetchHitClub();
+        if (!result) {
+            return res.status(503).json({ error: 'Không thể lấy dữ liệu từ HitClub, vui lòng thử lại sau' });
+        }
+        
+        const { current, history } = result;
+        
+        // Cập nhật dự đoán trước đó (nếu có)
+        const lastPred = hitclubDB.data[0];
+        if (lastPred && lastPred.phien_thuc_te === current.phien - 1) {
+            const dung = capNhatThongKe(lastPred.duDoan, current.ket_qua);
+            lastPred.thuc_te = current.ket_qua;
+            lastPred.dice_thuc_te = current.dice;
+            lastPred.ket_qua = dung ? 'ĐÚNG' : 'SAI';
+        }
+        
+        // Kiểm tra cache theo phiên (để F5 không đổi kết quả)
+        const phienHienTai = current.phien;
+        if (hitclubDB.cache.has(phienHienTai)) {
+            const cached = hitclubDB.cache.get(phienHienTai);
+            // Ghi lại dự đoán từ cache
+            const newPred = {
+                phien_du_doan: phienHienTai + 1,
+                duDoan: cached.duDoan,
+                dice_du_doan: cached.dice,
+                tong_du_doan: cached.tong,
+                do_tin_cay: cached.doTinCay,
+                phien_thuc_te: phienHienTai,
+                thuc_te: null,
+                dice_thuc_te: null,
+                ket_qua: null,
+                thoi_gian: new Date()
+            };
+            hitclubDB.data.unshift(newPred);
+            if (hitclubDB.data.length > 100) hitclubDB.data.pop();
+            
+            return res.json({
+                success: true,
+                game: 'HITCLUB TÀI XỈU (HŨ)',
+                phien_hien_tai: phienHienTai,
+                ket_qua_truoc: {
+                    phien: current.phien,
+                    ket_qua: current.ket_qua,
+                    dice: current.dice,
+                    tong: current.tong
+                },
+                du_doan_phien_tiep: {
+                    phien: phienHienTai + 1,
+                    du_doan: cached.duDoan,
+                    dice_du_doan: cached.dice,
+                    tong_du_doan: cached.tong,
+                    do_tin_cay: cached.doTinCay + '%'
+                },
+                thong_ke_tong_hop: hitclubDB.thongKe,
+                thoi_gian_du_doan: new Date(),
+                author: '@tranhoang2286'
+            });
+        }
+        
+        // Xây dựng lịch sử kết quả từ API
+        const lichSuResult = history.map(item => item.resultTruyenThong);
+        const lichSuDice = history.map(item => item.dices);
+        
+        // Dự đoán cho phiên tiếp theo
+        const duDoan = duDoanXucXac(lichSuResult, lichSuDice);
+        
+        // Lưu cache theo phiên hiện tại
+        hitclubDB.cache.set(phienHienTai, {
+            duDoan: duDoan.duDoan,
+            dice: duDoan.dice,
+            tong: duDoan.tong,
+            doTinCay: duDoan.doTinCay
+        });
+        if (hitclubDB.cache.size > 20) {
+            const firstKey = hitclubDB.cache.keys().next().value;
+            hitclubDB.cache.delete(firstKey);
+        }
+        
+        // Lưu dự đoán vào lịch sử
+        const newPred = {
+            phien_du_doan: phienHienTai + 1,
+            duDoan: duDoan.duDoan,
+            dice_du_doan: duDoan.dice,
+            tong_du_doan: duDoan.tong,
+            do_tin_cay: duDoan.doTinCay,
+            phien_thuc_te: phienHienTai,
+            thuc_te: null,
+            dice_thuc_te: null,
+            ket_qua: null,
+            thoi_gian: new Date()
+        };
+        hitclubDB.data.unshift(newPred);
+        if (hitclubDB.data.length > 100) hitclubDB.data.pop();
+        
+        // Trả về kết quả
+        res.json({
+            success: true,
+            game: 'HITCLUB TÀI XỈU (HŨ)',
+            phien_hien_tai: phienHienTai,
+            ket_qua_truoc: {
+                phien: current.phien,
+                ket_qua: current.ket_qua,
+                dice: current.dice,
+                tong: current.tong
+            },
+            du_doan_phien_tiep: {
+                phien: phienHienTai + 1,
+                du_doan: duDoan.duDoan,
+                dice_du_doan: duDoan.dice,
+                tong_du_doan: duDoan.tong,
+                do_tin_cay: duDoan.doTinCay + '%',
+                giai_thich: duDoan.giaiThich
+            },
+            thong_ke_tong_hop: hitclubDB.thongKe,
+            thoi_gian_du_doan: new Date(),
+            author: '@tranhoang2286'
+        });
+        
+    } catch (error) {
+        console.error('Lỗi xử lý request:', error);
+        res.status(500).json({ error: 'Lỗi server, vui lòng thử lại sau' });
     }
 });
 
-app.get('/sunwin-sicbo', async (req, res) => {
-    try {
-        const result = await xuLyYeuCau('sicbo');
-        res.json(result);
-    } catch (e) {
-        res.status(500).json({ error: e.message });
-    }
-});
-
-app.get('/lich-su', (req, res) => {
+// Endpoint xem lịch sử dự đoán
+app.get('/hitclub/lich-su', (req, res) => {
     res.json({
-        tai_xiu: history.tx.data.slice(0,20).map(p => ({
-            phien_du_doan: p.phien_du_doan,
-            du_doan_dice: p.dice,
-            thuc_te: p.thuc_te,
-            ket_qua: p.dung_sai
+        success: true,
+        lich_su_du_doan: hitclubDB.data.slice(0, 30).map(item => ({
+            phien_du_doan: item.phien_du_doan,
+            du_doan: item.duDoan,
+            dice_du_doan: item.dice_du_doan,
+            thuc_te: item.thuc_te,
+            dice_thuc_te: item.dice_thuc_te,
+            ket_qua: item.ket_qua,
+            thoi_gian: item.thoi_gian
         })),
-        sicbo: history.sicbo.data.slice(0,20).map(p => ({
-            phien_du_doan: p.phien_du_doan,
-            vi_doan: p.viList,
-            thuc_te: p.thuc_te_vi,
-            ket_qua: p.dung_sai
-        }))
+        thong_ke_tong_hop: hitclubDB.thongKe
     });
 });
 
 app.get('/', (req, res) => {
     res.json({
-        name: 'Sunwin Tài Xỉu & Sicbo - Dự đoán động',
+        name: 'API HITCLUB TÀI XỈU - DỰ ĐOÁN XÚC XẮC',
+        author: '@tranhoang2286',
+        version: '2.0',
         endpoints: {
-            'Tài Xỉu (dự đoán 3 mặt xúc xắc)': '/sunwin-tx',
-            'Sicbo (dự đoán 4 vị cược)': '/sunwin-sicbo',
-            'Lịch sử': '/lich-su'
+            'Dự đoán phiên tiếp theo': '/hitclub',
+            'Xem lịch sử dự đoán': '/hitclub/lich-su'
         },
-        note: 'Mỗi phiên dự đoán chỉ tính một lần, F5 không đổi kết quả. Vị Sicbo: Tài >10 và có 17, Xỉu ≤10.'
+        giai_thich: 'Thuật toán sử dụng phân tích xác suất thực tế từ lịch sử kết quả, không có random. Độ tin cậy 50-80% dựa trên mức độ đồng thuận của các thuật toán.'
     });
 });
 
 app.listen(PORT, '0.0.0.0', () => {
-    console.log(`✅ Server Sunwin đang chạy tại port ${PORT}`);
-    console.log(`🎲 Tài Xỉu: /sunwin-tx → dự đoán 3 mặt xúc xắc`);
-    console.log(`🎯 Sicbo: /sunwin-sicbo → dự đoán 4 vị cược (xác suất động)`);
+    console.log(`\n🚀 HITCLUB TÀI XỈU API`);
+    console.log(`📡 PORT: ${PORT}`);
+    console.log(`🎯 Endpoint: http://localhost:${PORT}/hitclub`);
+    console.log(`📊 Thuật toán: Xác suất thực tế, không random`);
+    console.log(`👤 Author: @tranhoang2286`);
 });
