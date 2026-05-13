@@ -8,8 +8,9 @@ app.use(express.json());
 
 const PORT = process.env.PORT || 5000;
 
-// Cấu hình API HitClub (không random, thuần toán học)
-const API_HITCLUB = 'https://wtxmd52.tele68.com/v1/txmd5/sessions?cp=R&cl=R&pf=web&at=e2f4446802e76a39767a5bab32154970';
+// Cấu hình API HitClub mới
+// const API_HITCLUB_OLD = 'https://wtxmd52.tele68.com/v1/txmd5/sessions?cp=R&cl=R&pf=web&at=e2f4446802e76a39767a5bab32154970';
+const API_HITCLUB_NEW = 'https://sun-win.onrender.com/api/history';
 
 // Lưu trữ lịch sử và thống kê
 let hitclubDB = {
@@ -153,21 +154,26 @@ function capNhatThongKe(duDoan, thucTe) {
     return dung;
 }
 
-// Hàm fetch dữ liệu từ API HitClub
+// Hàm fetch dữ liệu từ API HitClub mới
 async function fetchHitClub() {
     try {
-        const res = await axios.get(API_HITCLUB, { timeout: 10000 });
-        if (res.data && res.data.list && res.data.list.length > 0) {
-            const first = res.data.list[0];
-            const data = {
-                phien: first.id,
-                ket_qua: first.resultTruyenThong, // "TAI" hoặc "XIU"
-                dice: first.dices,
-                tong: first.point
-            };
-            // Lấy lịch sử tối đa 200 phiên
-            const history = res.data.list.slice(0, 200);
-            return { current: data, history };
+        const res = await axios.get(API_HITCLUB_NEW, { timeout: 10000 });
+        // Kiểm tra cấu trúc dữ liệu trả về từ API mới
+        if (res.data && res.data.taixiu && res.data.taixiu.length > 0) {
+            // API mới trả về một mảng các phiên gần nhất, phiên đầu tiên là mới nhất
+            const history = res.data.taixiu.slice(0, 200);
+            // Chuẩn hóa dữ liệu từ API mới sang định dạng mà thuật toán đang dùng
+            const normalizedHistory = history.map(item => ({
+                phien: item.Phien,
+                resultTruyenThong: item.Ket_qua === 'Tài' ? 'TAI' : 'XIU',  // Chuyển "Tài" -> "TAI"
+                dices: [item.Xuc_xac_1, item.Xuc_xac_2, item.Xuc_xac_3],
+                point: item.Tong
+            }));
+            
+            // Lấy phiên mới nhất
+            const current = normalizedHistory[0];
+            
+            return { current, history: normalizedHistory };
         }
         return null;
     } catch (error) {
@@ -189,9 +195,9 @@ app.get('/hitclub', async (req, res) => {
         // Cập nhật dự đoán trước đó (nếu có)
         const lastPred = hitclubDB.data[0];
         if (lastPred && lastPred.phien_thuc_te === current.phien - 1) {
-            const dung = capNhatThongKe(lastPred.duDoan, current.ket_qua);
-            lastPred.thuc_te = current.ket_qua;
-            lastPred.dice_thuc_te = current.dice;
+            const dung = capNhatThongKe(lastPred.duDoan, current.resultTruyenThong);
+            lastPred.thuc_te = current.resultTruyenThong;
+            lastPred.dice_thuc_te = current.dices;
             lastPred.ket_qua = dung ? 'ĐÚNG' : 'SAI';
         }
         
@@ -221,9 +227,9 @@ app.get('/hitclub', async (req, res) => {
                 phien_hien_tai: phienHienTai,
                 ket_qua_truoc: {
                     phien: current.phien,
-                    ket_qua: current.ket_qua,
-                    dice: current.dice,
-                    tong: current.tong
+                    ket_qua: current.resultTruyenThong,
+                    dice: current.dices,
+                    tong: current.point
                 },
                 du_doan_phien_tiep: {
                     phien: phienHienTai + 1,
@@ -280,9 +286,9 @@ app.get('/hitclub', async (req, res) => {
             phien_hien_tai: phienHienTai,
             ket_qua_truoc: {
                 phien: current.phien,
-                ket_qua: current.ket_qua,
-                dice: current.dice,
-                tong: current.tong
+                ket_qua: current.resultTruyenThong,
+                dice: current.dices,
+                tong: current.point
             },
             du_doan_phien_tiep: {
                 phien: phienHienTai + 1,
@@ -324,7 +330,7 @@ app.get('/', (req, res) => {
     res.json({
         name: 'API HITCLUB TÀI XỈU - DỰ ĐOÁN XÚC XẮC',
         author: '@tranhoang2286',
-        version: '2.0',
+        version: '3.0',
         endpoints: {
             'Dự đoán phiên tiếp theo': '/hitclub',
             'Xem lịch sử dự đoán': '/hitclub/lich-su'
